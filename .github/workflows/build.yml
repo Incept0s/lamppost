@@ -32,7 +32,7 @@ jobs:
     container: fedora:latest
     steps:
       - name: Build tools
-        run: dnf -y install --setopt=install_weak_deps=False make git rpm-build cargo rust
+        run: dnf -y install --setopt=install_weak_deps=False make git rpm-build cargo rust python3
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Build the RPM
