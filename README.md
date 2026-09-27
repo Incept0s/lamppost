@@ -7,7 +7,7 @@
 **An XAMPP-style local web stack, built on your distribution's own packages.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Fedora](https://img.shields.io/badge/Fedora-42%2B-51a2da.svg)](https://fedoraproject.org/)
+[![Fedora](https://img.shields.io/badge/Fedora-43%2B-51a2da.svg)](https://fedoraproject.org/)
 [![Debian](https://img.shields.io/badge/Debian-13%2B-a80030.svg)](https://www.debian.org/)
 [![Packages](https://img.shields.io/badge/packages-RPM%20%7C%20DEB%20%7C%20AppImage-f27121.svg)](../../releases)
 
@@ -88,7 +88,7 @@ takes effect.
 
 ## Requirements
 
-* Fedora 42+, Debian 13+, Ubuntu 24.04+ (other distributions may work; the
+* Fedora 43+, Debian 13+, Ubuntu 24.04+ (other distributions may work; the
   package names are detected, not hard-coded)
 * A desktop session for the control panel — no Qt, GTK or Python runtime
   needed, the panel is a single 13 MB binary
@@ -254,7 +254,7 @@ can run at a time. Both can stay installed.
 
 ## Project status
 
-Beta, and honest about it.
+Version 1.0, the first public release.
 
 | | |
 |---|---|

@@ -28,8 +28,10 @@ jobs:
         run: cd panel && cargo build --release && cargo clippy --release -- -D warnings
 
   rpm:
+    # built on the oldest supported Fedora: an RPM built on a newer one needs its
+    # newer glibc and refuses to install on older releases (bump when it goes EOL)
     runs-on: ubuntu-latest
-    container: fedora:latest
+    container: fedora:43
     steps:
       - name: Build tools
         run: dnf -y install --setopt=install_weak_deps=False make git rpm-build cargo rust python3
