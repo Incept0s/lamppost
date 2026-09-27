@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build output
+/build/
+/dist/
+/rpmbuild/
+/panel/target/
+*.rpm
+*.deb
+*.AppImage
+*.tar.gz
+/THIRD-PARTY-LICENSES.txt
+
+# Editors
+*.swp
+*~
+.idea/
+.vscode/
+
+# Never commit a rendered instance: it contains the generated FTP password
+/instance/

@@ -1,0 +1,86 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install shell and PHP linters
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck php-cli
+      - name: Shell scripts
+        run: |
+          bash -n install.sh uninstall.sh src/lamppost src/distro.sh
+          shellcheck -S warning install.sh uninstall.sh src/lamppost src/distro.sh \
+                     packaging/build-deb.sh packaging/build-appimage.sh
+      - name: PHP syntax
+        run: php -l htdocs/index.php && php -l htdocs/dashboard/index.php
+      - name: Python servers
+        run: python3 -m py_compile src/lamppost-ftpd src/mail-catcher
+      - name: Control panel
+        run: cd panel && cargo build --release && cargo clippy --release -- -D warnings
+
+  rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Build tools
+        run: dnf -y install --setopt=install_weak_deps=False make git rpm-build cargo rust
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build the RPM
+        run: make rpm
+      - name: Show what is in it
+        run: rpm -qip rpmbuild/RPMS/*/*.rpm && rpm -qlp rpmbuild/RPMS/*/*.rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lamppost-rpm
+          path: rpmbuild/RPMS/*/*.rpm
+
+  deb-and-appimage:
+    # built on the oldest supported Ubuntu, so the binary runs on newer ones too
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq dpkg-dev fuse libfuse2
+      - name: Build the control panel
+        run: cd panel && cargo build --release
+      - name: Build the .deb
+        run: make deb
+      - name: Build the AppImage
+        run: make appimage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+      - name: Check the package
+        run: dpkg-deb --info dist/*.deb && dpkg-deb --contents dist/*.deb | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lamppost-deb-appimage
+          path: dist/*
+
+  release:
+    needs: [lint, rpm, deb-and-appimage]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach the packages to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/lamppost-rpm/*/*.rpm
+            artifacts/lamppost-deb-appimage/*
+          generate_release_notes: true

@@ -1,0 +1,8 @@
+#!/bin/sh
+# LAMPPost mailtodisk - used as PHP's sendmail_path (see php/php.ini).
+# Instead of sending, every mail from PHP's mail() is saved as a file in
+# @PREFIX@/mailoutput, like XAMPP's mailtodisk on Windows.
+outdir="@PREFIX@/mailoutput"
+mkdir -p "$outdir"
+file="$outdir/mail-$(date +%Y%m%d-%H%M%S)-$$.eml"
+cat > "$file"

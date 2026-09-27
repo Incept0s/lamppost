@@ -1,0 +1,127 @@
+#!/usr/bin/python3
+"""LAMPPost mail catcher.
+
+A tiny SMTP server on 127.0.0.1:25 that accepts every message and saves it
+as an .eml file in <prefix>/mailoutput instead of delivering it. Nothing is
+ever sent to the internet.
+
+Runs as your normal user (port 25 is unlocked by
+/etc/sysctl.d/50-lamppost.conf) and daemonizes itself. If it is ever started
+as root, it drops privileges to --user before accepting any connection.
+"""
+import argparse
+import asyncio
+import datetime
+import itertools
+import os
+import pwd
+import signal
+import socket
+import sys
+
+from aiosmtpd.smtp import SMTP
+
+
+class DiskHandler:
+    def __init__(self, outdir, logfile):
+        self.outdir = outdir
+        self.logfile = logfile
+        self.counter = itertools.count(1)
+
+    def log(self, message):
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.logfile, "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp}  {message}\n")
+
+    async def handle_DATA(self, server, session, envelope):
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"mail-{stamp}-{os.getpid()}-{next(self.counter)}.eml"
+        path = os.path.join(self.outdir, name)
+        header = (
+            f"X-LAMPPost-Mail-From: {envelope.mail_from}\r\n"
+            f"X-LAMPPost-Rcpt-To: {', '.join(envelope.rcpt_tos)}\r\n"
+        ).encode()
+        with open(path, "wb") as fh:
+            fh.write(header + envelope.original_content)
+        self.log(f"saved {name}  from={envelope.mail_from}  to={','.join(envelope.rcpt_tos)}")
+        return "250 OK: message saved by LAMPPost (not delivered)"
+
+
+def drop_privileges(user):
+    pw = pwd.getpwnam(user)
+    if pw.pw_uid == 0:
+        sys.exit("mail-catcher: refusing to run as root")
+    os.setgroups([])
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
+
+
+def daemonize():
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    os.chdir("/")
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--user")
+    parser.add_argument("--prefix", required=True)
+    parser.add_argument("--port", type=int, default=25)
+    args = parser.parse_args()
+
+    outdir = os.path.join(args.prefix, "mailoutput")
+    maildir = os.path.join(args.prefix, "mail")
+    pidfile = os.path.join(maildir, "mail.pid")
+    logfile = os.path.join(maildir, "mail.log")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", args.port))
+    sock.listen(16)
+    sock.setblocking(False)
+
+    if os.getuid() == 0:
+        if not args.user:
+            sys.exit("mail-catcher: running as root requires --user")
+        drop_privileges(args.user)
+    os.umask(0o022)
+    os.makedirs(outdir, exist_ok=True)
+
+    daemonize()
+    with open(pidfile, "w") as fh:
+        fh.write(f"{os.getpid()}\n")
+
+    handler = DiskHandler(outdir, logfile)
+    handler.log(f"Mail catcher started on 127.0.0.1:{args.port}, saving to {outdir}")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def shutdown():
+        handler.log("Mail catcher stopped")
+        loop.stop()
+
+    loop.add_signal_handler(signal.SIGTERM, shutdown)
+    loop.add_signal_handler(signal.SIGINT, shutdown)
+    server = loop.run_until_complete(loop.create_server(
+        lambda: SMTP(handler, hostname="localhost",
+                     ident="LAMPPost mail catcher (catches all mail)"),
+        sock=sock))
+    try:
+        loop.run_forever()
+    finally:
+        server.close()
+        try:
+            os.unlink(pidfile)
+        except FileNotFoundError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

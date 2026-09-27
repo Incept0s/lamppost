@@ -1,0 +1,83 @@
+#!/usr/bin/python3
+"""LAMPPost FTP server, powered by pyftpdlib.
+
+Runs as your normal user. Users, passwords and folders are defined in
+<prefix>/ftp/lamppost-ftp.ini - its own user list
+Server, these are FTP-only accounts, not your Linux password.
+"""
+import argparse
+import configparser
+import logging
+import os
+import signal
+import sys
+
+from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.servers import FTPServer
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prefix", required=True)
+    args = parser.parse_args()
+
+    base = os.path.join(args.prefix, "ftp")
+    cfg = configparser.ConfigParser(interpolation=None)
+    if not cfg.read(os.path.join(base, "lamppost-ftp.ini")):
+        sys.exit("lamppost-ftpd: cannot read lamppost-ftp.ini")
+
+    server_cfg = cfg["server"]
+    address = server_cfg.get("address", "127.0.0.1")
+    port = server_cfg.getint("port", 21)
+    passive = server_cfg.get("passive_ports", "50000-50050")
+
+    authorizer = DummyAuthorizer()
+    users = 0
+    for section in cfg.sections():
+        if not section.startswith("user:"):
+            continue
+        user = cfg[section]
+        name = section.split(":", 1)[1]
+        home = user.get("home", os.path.join(args.prefix, "htdocs"))
+        authorizer.add_user(name, user["password"], home,
+                            perm=user.get("permissions", "elradfmwMT"))
+        users += 1
+    if not users:
+        sys.exit("lamppost-ftpd: no [user:...] section in lamppost-ftp.ini")
+
+    logging.basicConfig(filename=os.path.join(base, "logs", "ftpd.log"),
+                        level=logging.INFO,
+                        format="%(asctime)s  %(message)s")
+
+    handler = FTPHandler
+    handler.authorizer = authorizer
+    handler.banner = server_cfg.get("banner", "LAMPPost FTP Server ready")
+    handler.permit_foreign_addresses = False
+    low, _, high = passive.partition("-")
+    handler.passive_ports = range(int(low), int(high or low) + 1)
+
+    server = FTPServer((address, port), handler)
+    server.max_cons = 32
+
+    pidfile = os.path.join(base, "ftpd.pid")
+    with open(pidfile, "w") as fh:
+        fh.write(f"{os.getpid()}\n")
+
+    def stop(*_):
+        raise KeyboardInterrupt  # serve_forever(handle_exit=True) closes everything
+
+    signal.signal(signal.SIGTERM, stop)
+    logging.info("LAMPPost FTP server listening on %s:%d", address, port)
+    try:
+        server.serve_forever(handle_exit=True)
+    finally:
+        logging.info("LAMPPost FTP server stopped")
+        try:
+            os.unlink(pidfile)
+        except FileNotFoundError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

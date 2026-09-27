@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LAMPPost Control Panel
+Comment=Start and stop Apache, MariaDB, FTP, Mail and Tomcat
+Exec=@PREFIX@/lamppost-control
+Icon=lamppost
+Categories=Development;
+Keywords=apache;mariadb;mysql;php;phpmyadmin;tomcat;ftp;webserver;
+Terminal=false
+StartupWMClass=lamppost-control

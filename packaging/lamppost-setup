@@ -1,0 +1,7 @@
+#!/bin/sh
+# LAMPPost per-user setup (installed by the RPM).
+#
+# The RPM installs the program files and the dependencies system-wide; this
+# creates your personal LAMPPost instance in /opt/lamppost. Run it once as
+# your normal user, not with sudo.
+exec /usr/share/lamppost/install.sh --skip-packages "$@"

@@ -1,0 +1,27 @@
+[package]
+name = "lamppost-control"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Control panel for LAMPPost, an XAMPP-style local web stack"
+license = "MIT"
+repository = "https://github.com/Incept0s/lamppost"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+crossbeam-channel = "0.5.17"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+ksni = "0.3.6"
+libc = "0.2.189"
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "time", "sync"] }
+
+[[bin]]
+name = "lamppost-control"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

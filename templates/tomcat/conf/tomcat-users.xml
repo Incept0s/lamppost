@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LAMPPost - Tomcat users
+
+  To use the Tomcat Manager (http://localhost:8080/manager/html), remove the
+  comment markers around the user below, choose your own password and
+  restart Tomcat in the LAMPPost Control Panel.
+-->
+<tomcat-users xmlns="http://tomcat.apache.org/xml"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xsi:schemaLocation="http://tomcat.apache.org/xml tomcat-users.xsd"
+              version="1.0">
+<!--
+  <role rolename="manager-gui"/>
+  <role rolename="admin-gui"/>
+  <user username="admin" password="choose-a-password" roles="manager-gui,admin-gui"/>
+-->
+</tomcat-users>

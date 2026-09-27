@@ -1,0 +1,454 @@
+#!/bin/bash
+#
+# LAMPPost command line tool (like XAMPP's "lampp")
+#
+#   lamppost start   [module...]   start modules (default: apache mariadb)
+#   lamppost stop    [module...]   stop modules  (default: all)
+#   lamppost restart [module...]
+#   lamppost status               show all modules
+#   lamppost missing [module...]  list distribution packages a module still needs
+#   lamppost install [module...]  install them (asks for the password once)
+#
+# Modules: apache mariadb ftp mail tomcat all
+# Everything runs as your user - no password needed. Ports below 1024 are
+# unlocked by /etc/sysctl.d/50-lamppost.conf (created by install.sh).
+#
+# Exit codes: 0 ok, 1 failed, 2 usage, 3 a module is not installed.
+#
+set -uo pipefail
+
+PREFIX=/opt/lamppost
+ALL_MODULES=(apache mariadb ftp mail tomcat)
+
+# where this distribution keeps Apache, PHP, MariaDB and Tomcat
+# shellcheck source=distro.sh
+. "$PREFIX/distro.sh"
+
+read_pid() { [ -f "$1" ] && head -n1 "$1" | tr -dc '0-9'; }
+
+pid_is() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] || return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$1/cmdline" | grep -qF -- "$2"
+}
+
+# A PID file alone can lie (stale file, recycled PID), so the process must
+# also carry our own config path - which works whatever the distribution
+# calls its binaries (httpd or apache2, mariadbd or mysqld).
+module_pid() {
+    local pid
+    case "$1" in
+        apache)  pid=$(read_pid "$PREFIX/apache/logs/httpd.pid");     pid_is "$pid" "$PREFIX/apache/conf/httpd.conf" ;;
+        mariadb) pid=$(read_pid "$PREFIX/mariadb/data/mariadb.pid");  pid_is "$pid" "$PREFIX/mariadb/my.cnf" ;;
+        ftp)     pid=$(read_pid "$PREFIX/ftp/ftpd.pid");              pid_is "$pid" "$PREFIX/ftp/lamppost-ftpd" ;;
+        mail)    pid=$(read_pid "$PREFIX/mail/mail.pid");             pid_is "$pid" "$PREFIX/mail/mail-catcher" ;;
+        tomcat)  pid=$(read_pid "$PREFIX/tomcat/temp/tomcat.pid");    pid_is "$pid" "catalina.base=$PREFIX/tomcat" ;;
+        *) return 1 ;;
+    esac && echo "$pid"
+}
+
+# The distribution packages a module needs.
+module_packages() {
+    if [ "$LAMPPOST_FAMILY" = deb ]; then
+        case "$1" in
+            apache)  echo "apache2 php-fpm php-cli php-mysql php-gd php-mbstring php-intl php-xml php-zip phpmyadmin" ;;
+            mariadb) echo "mariadb-server mariadb-client" ;;
+            ftp)     echo "python3-pyftpdlib" ;;
+            mail)    echo "python3-aiosmtpd" ;;
+            tomcat)  echo "tomcat10 tomcat10-admin" ;;
+        esac
+    else
+        case "$1" in
+            apache)  echo "httpd mod_ssl php-fpm php-cli php-mysqlnd php-gd php-mbstring php-intl php-xml php-pecl-zip php-sodium phpMyAdmin" ;;
+            mariadb) echo "mariadb-server mariadb" ;;
+            ftp)     echo "python3-pyftpdlib" ;;
+            mail)    echo "python3-aiosmtpd" ;;
+            tomcat)  echo "tomcat tomcat-webapps tomcat-admin-webapps" ;;
+        esac
+    fi
+}
+
+package_installed() {
+    if [ "$LAMPPOST_FAMILY" = deb ]; then
+        dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
+    else
+        rpm -q "$1" >/dev/null 2>&1
+    fi
+}
+
+missing_packages() {  # <module...>: one package per line, no duplicates
+    local m p
+    for m in "$@"; do
+        for p in $(module_packages "$m"); do package_installed "$p" || echo "$p"; done
+    done | awk '!seen[$0]++'
+}
+
+# Is the module installed and set up in /opt/lamppost? A missing package
+# or missing instance files both mean: run "lamppost install <module>".
+module_available() {
+    case "$1" in
+        apache)  [ -x "${APACHE_BIN:-}" ] && [ -x "${PHPFPM_BIN:-}" ] &&
+                 [ -f "$PREFIX/apache/conf/httpd.conf" ] ;;
+        mariadb) [ -x "${MARIADBD_BIN:-}" ] && [ -d "$PREFIX/mariadb/data/mysql" ] ;;
+        ftp)     [ -x "${PYTHON_BIN:-}" ] && "$PYTHON_BIN" -c "import pyftpdlib" 2>/dev/null ;;
+        mail)    [ -x "${PYTHON_BIN:-}" ] && "$PYTHON_BIN" -c "import aiosmtpd" 2>/dev/null ;;
+        tomcat)  [ -x "${JAVA_BIN:-}" ] && [ -f "${TOMCAT_HOME:-/nonexistent}/bin/bootstrap.jar" ] &&
+                 [ -f "$PREFIX/tomcat/conf/server.xml" ] ;;
+    esac
+}
+
+is_running() { module_pid "$1" >/dev/null; }
+
+display_name() {
+    case "$1" in
+        apache) echo "Apache" ;; mariadb) echo "MariaDB" ;; ftp) echo "FTP Server" ;;
+        mail) echo "Mail Catcher" ;; tomcat) echo "Tomcat" ;;
+    esac
+}
+
+module_ports() {
+    case "$1" in
+        apache) echo "80 443" ;; mariadb) echo "3306" ;; ftp) echo "21" ;;
+        mail) echo "25" ;; tomcat) echo "8080 8005" ;;
+    esac
+}
+
+wait_for() {  # <module> <running|stopped> <seconds>
+    for _ in $(seq 1 $(( $3 * 5 ))); do
+        if [ "$2" = running ]; then is_running "$1" && return 0
+        else is_running "$1" || return 0; fi
+        sleep 0.2
+    done
+    return 1
+}
+
+stop_pid() {  # <module> <signal> <seconds>
+    local pid
+    pid=$(module_pid "$1") || return 0
+    kill "-$2" "$pid"
+    wait_for "$1" stopped "$3" || { kill -KILL "$pid" 2>/dev/null; sleep 0.5; }
+}
+
+check_ports() {  # <module>: ports free and allowed for normal users?
+    local port start
+    start=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)
+    for port in $(module_ports "$1"); do
+        if [ "$port" -lt "$start" ]; then
+            echo "  Port $port is not allowed for normal users (limit: $start)." >&2
+            echo "  Run install.sh again - it sets up /etc/sysctl.d/50-lamppost.conf." >&2
+            return 1
+        fi
+        if ss -Htln "sport = :$port" | grep -q .; then
+            echo "  Port $port is already in use (XAMPP or another program?)" >&2
+            return 1
+        fi
+    done
+}
+
+# --- Apache + PHP-FPM -------------------------------------------------------
+apache_start() {
+    # older installations list their modules inline; newer ones include a
+    # generated file - create it if the configuration expects it
+    if grep -q "httpd-modules.conf" "$PREFIX/apache/conf/httpd.conf" &&
+       [ ! -f "$PREFIX/apache/conf/extra/httpd-modules.conf" ]; then
+        generate_apache_modules
+    fi
+    local fpm_pid
+    fpm_pid=$(read_pid "$PREFIX/tmp/php-fpm.pid")
+    if ! pid_is "$fpm_pid" php-fpm; then
+        rm -f "$PREFIX/tmp/php-fpm.sock" "$PREFIX/tmp/php-fpm.pid"
+        "$PHPFPM_BIN" --fpm-config "$PREFIX/php/php-fpm.conf" -c "$PREFIX/php/php.ini" || return 1
+    fi
+    rm -f "$PREFIX/apache/logs/httpd.pid"
+    "$APACHE_BIN" -f "$PREFIX/apache/conf/httpd.conf" -k start || return 1
+    wait_for apache running 10
+}
+
+apache_stop() {
+    if is_running apache; then
+        "$APACHE_BIN" -f "$PREFIX/apache/conf/httpd.conf" -k stop 2>/dev/null
+        wait_for apache stopped 10 || stop_pid apache TERM 5
+    fi
+    rm -f "$PREFIX/apache/logs/httpd.pid"
+    local fpm_pid
+    fpm_pid=$(read_pid "$PREFIX/tmp/php-fpm.pid")
+    if pid_is "$fpm_pid" php-fpm; then
+        kill -QUIT "$fpm_pid"
+        for _ in $(seq 1 25); do [ -d "/proc/$fpm_pid" ] || break; sleep 0.2; done
+    fi
+    rm -f "$PREFIX/tmp/php-fpm.pid" "$PREFIX/tmp/php-fpm.sock"
+}
+
+# --- MariaDB --------------------------------------------------------
+mariadb_start() {
+    rm -f "$PREFIX/tmp/mysql.sock"
+    setsid "$MARIADBD_BIN" --defaults-file="$PREFIX/mariadb/my.cnf" \
+        </dev/null >/dev/null 2>&1 &
+    wait_for mariadb running 20
+}
+
+mariadb_stop() { stop_pid mariadb TERM 30; }   # clean shutdown on SIGTERM
+
+# --- FTP server --------------------------------------------------------
+ftp_start() {
+    mkdir -p "$PREFIX/ftp/logs"
+    setsid "$PYTHON_BIN" "$PREFIX/ftp/lamppost-ftpd" --prefix "$PREFIX" \
+        </dev/null >>"$PREFIX/ftp/logs/ftpd.out" 2>&1 &
+    wait_for ftp running 10
+}
+
+ftp_stop() { stop_pid ftp TERM 10; }
+
+# --- Mail catcher -------------------------------------------------
+mail_start() {
+    "$PYTHON_BIN" "$PREFIX/mail/mail-catcher" --prefix "$PREFIX" || return 1
+    wait_for mail running 10
+}
+
+mail_stop() { stop_pid mail TERM 10; }
+
+# --- Tomcat -----------------------------------------------------------------
+tomcat_start() {
+    local base="$PREFIX/tomcat" home="$TOMCAT_HOME"
+    mkdir -p "$base/logs" "$base/temp" "$base/work"
+    (
+        cd "$base" || exit 1
+        setsid "$JAVA_BIN" \
+            -Djava.util.logging.config.file="$base/conf/logging.properties" \
+            -Djava.util.logging.manager=org.apache.juli.ClassLoaderLogManager \
+            -Djdk.tls.ephemeralDHKeySize=2048 \
+            -Djava.protocol.handler.pkgs=org.apache.catalina.webresources \
+            -Dorg.apache.catalina.security.SecurityListener.UMASK=0027 \
+            --add-opens=java.base/java.lang=ALL-UNNAMED \
+            --add-opens=java.base/java.io=ALL-UNNAMED \
+            --add-opens=java.base/java.util=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+            --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED \
+            --enable-native-access=ALL-UNNAMED \
+            -classpath "$home/bin/bootstrap.jar:$home/bin/tomcat-juli.jar" \
+            -Dcatalina.base="$base" -Dcatalina.home="$home" \
+            -Djava.io.tmpdir="$base/temp" \
+            org.apache.catalina.startup.Bootstrap start \
+            </dev/null >>"$base/logs/catalina.out" 2>&1 &
+        echo $! > "$base/temp/tomcat.pid"
+    )
+    # the JVM exists long before Tomcat is up (or has given up): wait for the
+    # HTTP port, and notice when the process dies instead
+    local pid
+    pid=$(read_pid "$base/temp/tomcat.pid")
+    for _ in $(seq 1 150); do   # 30 s
+        ss -Htln "sport = :8080" | grep -q . && return 0
+        kill -0 "$pid" 2>/dev/null || {
+            echo "  Tomcat exited during startup - see $base/logs/catalina.out" >&2
+            rm -f "$base/temp/tomcat.pid"
+            return 1
+        }
+        sleep 0.2
+    done
+    echo "  Tomcat did not open port 8080 within 30 s - see $base/logs/catalina.out" >&2
+    return 1
+}
+
+tomcat_stop() {
+    stop_pid tomcat TERM 30   # the JVM runs Tomcat's shutdown hook
+    rm -f "$PREFIX/tomcat/temp/tomcat.pid"
+}
+
+# --- installing missing modules -----------------------------------------------
+generate_apache_modules() {  # the Apache module list for the Apache now installed
+    local m builtin
+    builtin=$("$APACHE_BIN" -l 2>/dev/null | tr -d ' ' | sed -n 's/^mod_\(.*\)\.c$/\1/p')
+    {
+        echo "# Apache modules for $APACHE_BIN - generated by LAMPPost."
+        echo "# Built-in modules are skipped; they cannot be loaded again."
+        echo
+        for m in mpm_event unixd authz_core authz_host authz_user authn_core authn_file \
+                 auth_basic access_compat log_config mime dir autoindex alias rewrite \
+                 headers env setenvif expires filter deflate status vhost_alias proxy \
+                 proxy_fcgi socache_shmcb ssl http2; do
+            if printf '%s\n' "$builtin" | grep -qx "$m"; then
+                echo "# $m is built into this Apache"
+            elif [ -f "$APACHE_MODDIR/mod_$m.so" ]; then
+                printf 'LoadModule %s_module %s/mod_%s.so\n' "$m" "$APACHE_MODDIR" "$m"
+            else
+                echo "# mod_$m.so was not found in $APACHE_MODDIR"
+            fi
+        done
+    } > "$PREFIX/apache/conf/extra/httpd-modules.conf"
+}
+
+prepare_module() {  # what a freshly installed module needs in /opt/lamppost
+    case "$1" in
+        apache)
+            [ -x "${APACHE_BIN:-}" ] && generate_apache_modules ;;
+        mariadb)
+            if [ ! -d "$PREFIX/mariadb/data/mysql" ] && [ -x "${MARIADB_INSTALL_DB:-}" ]; then
+                echo "Initialising the database"
+                "$MARIADB_INSTALL_DB" --defaults-file="$PREFIX/mariadb/my.cnf" \
+                    --auth-root-authentication-method=normal --skip-test-db \
+                    > "$PREFIX/mariadb/install-db.log" 2>&1
+            fi ;;
+    esac
+}
+
+install_modules() {
+    local missing rc m need_root=0
+    missing=$(missing_packages "$@")
+    [ -n "$missing" ] && need_root=1
+    # Tomcat's configuration can only be copied as root (root-only on Debian)
+    for m in "$@"; do
+        [ "$m" = tomcat ] && [ ! -f "$PREFIX/tomcat/conf/server.xml" ] && need_root=1
+    done
+    if [ $need_root -eq 0 ]; then
+        echo "All required packages are installed"
+    else
+        [ -n "$missing" ] && echo "Installing: $(printf '%s ' $missing)"
+        # root gets module names only and works out the packages itself
+        pkexec "$PREFIX/lamppost" __root-install "$(id -un)" "$@"
+        rc=$?
+        [ $rc -eq 0 ] || { echo "Installation did not complete (exit code $rc)" >&2; return $rc; }
+        # shellcheck source=distro.sh
+        . "$PREFIX/distro.sh"   # the new programs are there now
+    fi
+    for m in "$@"; do prepare_module "$m"; done
+    echo "Ready"
+}
+
+root_install() {  # runs through pkexec: <owner> <module...>
+    [ "$(id -u)" -eq 0 ] || { echo "lamppost: __root-install must run as root" >&2; exit 1; }
+    local owner=$1; shift
+    id "$owner" >/dev/null 2>&1 || { echo "lamppost: unknown user $owner" >&2; exit 1; }
+    local m
+    for m in "$@"; do
+        case "$m" in apache|mariadb|ftp|mail|tomcat) ;; *) echo "lamppost: unknown module '$m'" >&2; exit 2 ;; esac
+    done
+    local packages=()
+    mapfile -t packages < <(missing_packages "$@")
+    if [ ${#packages[@]} -gt 0 ]; then
+        if [ "$LAMPPOST_FAMILY" = deb ]; then
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || exit 1
+        else
+            dnf install -y "${packages[@]}" || exit 1
+        fi
+    fi
+    # shellcheck source=distro.sh
+    . "$PREFIX/distro.sh"
+    for m in "$@"; do
+        # Tomcat's configuration is root-only on some distributions
+        if [ "$m" = tomcat ] && [ -n "${TOMCAT_CONF:-}" ]; then
+            mkdir -p "$PREFIX/tomcat/conf" "$PREFIX/tomcat/webapps"
+            local f app
+            for f in server.xml web.xml context.xml catalina.properties catalina.policy \
+                     logging.properties jaspic-providers.xml; do
+                [ -e "$PREFIX/tomcat/conf/$f" ] || cp "$TOMCAT_CONF/$f" "$PREFIX/tomcat/conf/$f" 2>/dev/null
+            done
+            if [ -f "$PREFIX/tomcat/conf/server.xml" ] && ! grep -q 'address="127.0.0.1"' "$PREFIX/tomcat/conf/server.xml"; then
+                sed -i -E '0,/<Connector port="8080"/s//<Connector port="8080" address="127.0.0.1"/' \
+                    "$PREFIX/tomcat/conf/server.xml"
+            fi
+            for app in ROOT manager host-manager; do
+                [ -e "$PREFIX/tomcat/webapps/$app" ] || \
+                    cp -r "${TOMCAT_WEBAPPS:-/var/lib/tomcat/webapps}/$app" "$PREFIX/tomcat/webapps/$app" 2>/dev/null
+            done
+            chown -R "$owner:" "$PREFIX/tomcat"
+        fi
+    done
+}
+
+# --- dispatch ---------------------------------------------------------------
+expand_modules() {
+    local m out=()
+    for m in "$@"; do
+        case "$m" in
+            all) out+=("${ALL_MODULES[@]}") ;;
+            apache|mariadb|ftp|mail|tomcat) out+=("$m") ;;
+            # XAMPP's names still work
+            mysql) out+=(mariadb) ;; filezilla) out+=(ftp) ;; mercury) out+=(mail) ;;
+            *) echo "lamppost: unknown module '$m'" >&2; exit 2 ;;
+        esac
+    done
+    printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
+}
+
+start_modules() {
+    local rc=0 m
+    for m in "$@"; do
+        if is_running "$m"; then
+            echo "$(display_name "$m") is already running"
+            continue
+        fi
+        echo "Starting $(display_name "$m")..."
+        if ! module_available "$m"; then
+            echo "  $(display_name "$m"): not installed (run: lamppost install $m)" >&2
+            rc=3
+            continue
+        fi
+        if ! check_ports "$m"; then
+            echo "  $(display_name "$m"): start aborted, required port in use (see above)" >&2
+            [ $rc -eq 3 ] || rc=1
+            continue
+        fi
+        "${m}_start" || { echo "  $(display_name "$m") failed to start - check its log" >&2; [ $rc -eq 3 ] || rc=1; }
+    done
+    return $rc
+}
+
+stop_modules() {
+    local rc=0 m
+    for m in "$@"; do
+        is_running "$m" || continue
+        echo "Stopping $(display_name "$m")..."
+        "${m}_stop" || { echo "  $(display_name "$m") failed to stop" >&2; rc=1; }
+    done
+    return $rc
+}
+
+status() {
+    local m pid
+    printf '%-13s %-8s %s\n' "Module" "Status" "PID"
+    for m in "${ALL_MODULES[@]}"; do
+        if pid=$(module_pid "$m"); then
+            printf '%-13s %-8s %s\n' "$(display_name "$m")" "running" "$pid"
+        else
+            printf '%-13s %-8s\n' "$(display_name "$m")" "stopped"
+        fi
+    done
+}
+
+load_modules() {  # fills "mods"; an unknown module name ends the script
+    local list
+    list=$(expand_modules "$@") || exit 2
+    mapfile -t mods <<< "$list"
+}
+
+cmd=${1:-}
+shift || true
+case "$cmd" in
+    start)
+        [ $# -gt 0 ] || set -- apache mariadb
+        load_modules "$@"
+        start_modules "${mods[@]}"; exit $? ;;
+    stop)
+        [ $# -gt 0 ] || set -- all
+        load_modules "$@"
+        stop_modules "${mods[@]}"; exit $? ;;
+    restart)
+        [ $# -gt 0 ] || set -- apache mariadb
+        load_modules "$@"
+        stop_modules "${mods[@]}"; start_modules "${mods[@]}"; exit $? ;;
+    status)
+        status ;;
+    missing)
+        [ $# -gt 0 ] || set -- all
+        load_modules "$@"
+        missing_packages "${mods[@]}" ;;
+    install)
+        [ $# -gt 0 ] || set -- all
+        load_modules "$@"
+        install_modules "${mods[@]}"; exit $? ;;
+    __root-install)
+        root_install "$@"; exit $? ;;
+    *)
+        sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+        exit 2 ;;
+esac
